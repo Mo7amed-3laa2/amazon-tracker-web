@@ -1,0 +1,13 @@
+.env
+tracker.db
+tracker.db-wal
+tracker.db-shm
+__pycache__/
+*.pyc
+*.pyo
+
+# Frontend. dist/ is built ahead of deployment and copied to the Pi,
+# so it is a build artefact here rather than something to commit.
+node_modules/
+dist/
+.vite/

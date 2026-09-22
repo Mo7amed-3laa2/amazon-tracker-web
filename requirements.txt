@@ -1,0 +1,16 @@
+# Carried over from the Telegram bot, at the versions known to work on the Pi.
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+cloudscraper==1.2.71
+python-dotenv==1.0.1
+
+# Web stack. See CLAUDE.md, "Stack decision": FastAPI + React (Vite).
+# The frontend is built ahead of deployment, so the Pi never needs Node.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+itsdangerous==2.2.0
+
+# Same scheduler the bot used, so the ported sweep keeps its coalesce /
+# max_instances semantics.
+apscheduler==3.10.4
