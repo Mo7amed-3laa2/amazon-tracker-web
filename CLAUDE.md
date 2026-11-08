@@ -133,6 +133,12 @@ found by testing against live amazon.eg:
   code *before* the markers, which is the whole trick, and returns a reason the
   API turns into a message that names the real cause. This bug is in the bot too.
 
+**The sweep is paced.** Fetched back-to-back, a 42-item sweep ran in about a
+minute and Akamai challenged a few random items on every run. `scan.py` now
+waits 4–8 s between products and gives anything still `blocked` one more try
+after a 60 s cooldown at the end of the sweep. A sweep therefore takes roughly
+`items × 6 s` plus the retry pass, which matters when choosing an interval.
+
 `fetch_web.fetch()` returns a `FetchResult` carrying `reason` (`ok`,
 `not_found`, `blocked`, `unavailable`, `no_price`, `transport_error`) and a
 `detail` sentence. `not_found` answers 400 — it is the caller's bad link; the

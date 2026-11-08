@@ -15,6 +15,7 @@ instead. reference/scheduler_telegram.py keeps the wording for when it is wanted
 
 import asyncio
 import logging
+import random
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
@@ -33,6 +34,20 @@ PRICE_CHECK_JOB_ID = "price_check"
 # one still running (and hammering Amazon is what gets the host IP blocked).
 MIN_CHECK_INTERVAL_MINUTES = 10
 MAX_CHECK_INTERVAL_MINUTES = 7 * 24 * 60
+
+# Fetching back-to-back is what trips Akamai's bot check on amazon.eg: a
+# 42-item sweep that ran in about a minute had a few random items challenged
+# on every run. A human-sized gap between products keeps the request rate
+# under that threshold.
+PRODUCT_DELAY_SECONDS = (4.0, 8.0)
+# Items still challenged after their own retries get one more try at the end
+# of the sweep, once the burst has had time to cool off, instead of waiting a
+# whole interval for the next sweep.
+RETRY_COOLDOWN_SECONDS = 60
+
+
+async def _pause():
+    await asyncio.sleep(random.uniform(*PRODUCT_DELAY_SECONDS))
 
 
 def _now() -> str:
@@ -140,6 +155,7 @@ async def check_prices() -> ScanState:
         except Exception as e:
             state.last_error = str(e)
             logger.exception(f"[scan] Sweep failed: {e}")
+            _note(f"Sweep failed: {type(e).__name__}: {e}")
         finally:
             state.running = False
             state.finished_at = _now()
@@ -155,90 +171,119 @@ async def _sweep():
 
     _note(f"Checking {len(products)} product(s)")
 
-    for product in products:
-        url = product["url"]
-        product_name = product["name"] or url
-        last_price = product["last_price"]
-        # Rows added before the `available` column existed read as None, which
-        # has to count as "was available" or the first sweep after an upgrade
-        # reports every item as newly back in stock.
-        was_available = product["available"] in (None, 1)
-
-        # Blocking network I/O — keep it off the event loop so the API stays
-        # responsive while a sweep is running.
-        fetched = await asyncio.to_thread(fetch_web.fetch, url)
-        result = fetched.product
+    blocked = []
+    for i, product in enumerate(products):
+        if i:
+            await _pause()
         state.products_checked += 1
+        if await _check_one(product, retry_later=True) == fetch_web.BLOCKED:
+            blocked.append(product)
 
-        if result is None:
-            state.fetch_failures += 1
-            _note(f"Could not fetch '{product_name}': {fetched.detail}")
-            continue
-
-        # Any price still shown on a sold-out page is stale or belongs to
-        # another seller's offer, so it is neither alerted on nor stored —
-        # otherwise the site alerts on a price nobody can pay and then treats
-        # that phantom price as the baseline for the next comparison.
-        if not result.get("available", True):
-            if was_available:
-                _note(f"'{product_name}' is now unavailable — holding last known price")
-            set_product_availability(url, False)
-            continue
-
-        if not was_available:
-            _note(f"'{product_name}' is available again")
-            set_product_availability(url, True)
-
-        tracking.backfill_product_image(url, result.get("image"))
-
-        new_price = result["price"]
-        is_amazon = result.get("is_amazon", True)
-
-        if last_price is None:
-            update_price(url, new_price)
-            _note(f"Initial price set for '{product_name}': {new_price:,.2f}")
-            continue
-
-        if new_price == last_price:
-            continue
-
-        price_percent = ((last_price - new_price) / last_price) * 100
-        users = tracking.get_users_for_product_notification(product["id"])
-
-        if not users:
-            _note(f"No accounts tracking product {product['id']}")
-            update_price(url, new_price)
-            continue
-
-        matched = 0
-        for user in users:
-            if not _should_notify_user(
-                user["price_max"],
-                bool(user["require_amazon_merchant"]),
-                new_price,
-                is_amazon,
-            ):
-                logger.debug(
-                    f"[scan] Skipping alert for user {user['user_id']}: "
-                    f"price={new_price}, price_max={user['price_max']}, "
-                    f"is_amazon={is_amazon}, require_amazon={user['require_amazon_merchant']}"
-                )
-                continue
-
-            _deliver_alert(user["user_id"], product, last_price, new_price, user["price_max"])
-            matched += 1
-
-        # Written only after the alert decisions, so a delivery channel added
-        # later still sees the old baseline while it runs.
-        update_price(url, new_price)
-        state.products_changed += 1
-        state.alerts_matched += matched
+    if blocked:
         _note(
-            f"Price changed for '{product_name}': {last_price:,.2f} -> {new_price:,.2f} "
-            f"({price_percent:+.1f}%) [{matched} alert(s) matched]"
+            f"Retrying {len(blocked)} product(s) that hit a bot check, "
+            f"after a {RETRY_COOLDOWN_SECONDS}s cooldown"
         )
+        await asyncio.sleep(RETRY_COOLDOWN_SECONDS)
+        for i, product in enumerate(blocked):
+            if i:
+                await _pause()
+            await _check_one(product, retry_later=False)
 
     _note(f"Sweep complete: {state.products_changed} product(s) with price changes")
+
+
+async def _check_one(product: dict, retry_later: bool) -> str:
+    """Check one product and act on its price. Returns the fetch reason.
+
+    With `retry_later`, a bot check is not reported as a failure: the sweep
+    collects those and tries them once more after a cooldown.
+    """
+    url = product["url"]
+    product_name = product["name"] or url
+    last_price = product["last_price"]
+    # Rows added before the `available` column existed read as None, which
+    # has to count as "was available" or the first sweep after an upgrade
+    # reports every item as newly back in stock.
+    was_available = product["available"] in (None, 1)
+
+    # Blocking network I/O — keep it off the event loop so the API stays
+    # responsive while a sweep is running.
+    fetched = await asyncio.to_thread(fetch_web.fetch, url)
+    result = fetched.product
+
+    if result is None:
+        if retry_later and fetched.reason == fetch_web.BLOCKED:
+            logger.info(f"[scan] '{product_name}' hit a bot check — retrying at the end of the sweep")
+            return fetched.reason
+        state.fetch_failures += 1
+        _note(f"Could not fetch '{product_name}': {fetched.detail}")
+        return fetched.reason
+
+    # Any price still shown on a sold-out page is stale or belongs to
+    # another seller's offer, so it is neither alerted on nor stored —
+    # otherwise the site alerts on a price nobody can pay and then treats
+    # that phantom price as the baseline for the next comparison.
+    if not result.get("available", True):
+        if was_available:
+            _note(f"'{product_name}' is now unavailable — holding last known price")
+        set_product_availability(url, False)
+        return fetched.reason
+
+    if not was_available:
+        _note(f"'{product_name}' is available again")
+        set_product_availability(url, True)
+
+    tracking.backfill_product_image(url, result.get("image"))
+
+    new_price = result["price"]
+    is_amazon = result.get("is_amazon", True)
+
+    if last_price is None:
+        update_price(url, new_price)
+        _note(f"Initial price set for '{product_name}': {new_price:,.2f}")
+        return fetched.reason
+
+    if new_price == last_price:
+        return fetched.reason
+
+    price_percent = ((last_price - new_price) / last_price) * 100
+    users = tracking.get_users_for_product_notification(product["id"])
+
+    if not users:
+        _note(f"No accounts tracking product {product['id']}")
+        update_price(url, new_price)
+        return fetched.reason
+
+    matched = 0
+    for user in users:
+        if not _should_notify_user(
+            user["price_max"],
+            bool(user["require_amazon_merchant"]),
+            new_price,
+            is_amazon,
+        ):
+            logger.debug(
+                f"[scan] Skipping alert for user {user['user_id']}: "
+                f"price={new_price}, price_max={user['price_max']}, "
+                f"is_amazon={is_amazon}, require_amazon={user['require_amazon_merchant']}"
+            )
+            continue
+
+        _deliver_alert(user["user_id"], product, last_price, new_price, user["price_max"])
+        matched += 1
+
+    # Written only after the alert decisions, so a delivery channel added
+    # later still sees the old baseline while it runs.
+    update_price(url, new_price)
+    state.products_changed += 1
+    state.alerts_matched += matched
+    _note(
+        f"Price changed for '{product_name}': {last_price:,.2f} -> {new_price:,.2f} "
+        f"({price_percent:+.1f}%) [{matched} alert(s) matched]"
+    )
+
+    return fetched.reason
 
 
 async def refresh_product(product_id: int) -> tuple[dict | None, str]:
